@@ -1,66 +1,95 @@
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{post},
-    Json, Router,
-};
+use clap::Parser;
+
+use axum::{extract::State, routing::post, Json, Router};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+
+mod args;
+mod utils;
 
 #[tokio::main]
 async fn main() {
-    // initialize tracing
-    tracing_subscriber::fmt::init();
+    let args = args::Args::parse();
+
+    let (sender, receiver) = flume::unbounded::<ThreadGenerateRequest>();
+
+    utils::start_model_thread(
+        receiver,
+        args.model_path,
+        args.num_threads.try_into().unwrap(),
+        args.num_ctx_tokens.try_into().unwrap(),
+    );
 
     let app = Router::new()
-        .route("/completions", post(completion));
+        .route("/completions", post(completions))
+        .with_state(sender);
 
-    // TODO: load model/vocab and save into state
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    tracing::debug!("listening on {}", addr);
-    axum::Server::bind(&addr)
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();
 }
 
-async fn completion(Json(payload): Json<CompletionParameters>) -> impl IntoResponse {
-    let (model, vocab) = llama_rs::Model::load("models/7B/ggml-model-q4_0.bin", 512, |_| {}).unwrap();
-    let mut rng = rand::thread_rng();
-    // TODO: move model out of state to perform inference
-    model.inference_with_prompt(
-        &vocab, 
-        &llama_rs::InferenceParameters {
-            n_threads: 4,
-            n_predict: 128,
-            n_batch: 8,
-            top_k: 40,
-            repeat_last_n: 64,
-            top_p: 0.95,
-            repeat_penalty: 1.30,
-            temp: 0.80,
-        }, &payload.prompt, &mut rng, {
-            move |t| {
-                // TODO: figure out how to move out of callback to http response
-                println!("{:?}", t)
-            }
-        });
-    let response = CompletionResponse {
-        prompt: payload.prompt,
-        text: "response".into(), // TODO replace with model response
-    };
-    return (StatusCode::CREATED, Json(response))
-
+enum Token {
+    Token(String),
+    EndOfText,
 }
 
+pub struct ThreadGenerateRequest(GenerateRequest, flume::Sender<Token>);
+
 #[derive(Deserialize)]
-struct CompletionParameters {
-    prompt: String,
+#[serde(default)]
+struct GenerateRequest {
+    pub prompt: String,
+    pub max_tokens: usize,
+    pub batch_size: usize,
+    pub repeat_last_n: usize,
+    pub repeat_penalty: f32,
+    pub temp: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+}
+impl Default for GenerateRequest {
+    fn default() -> Self {
+        Self {
+            prompt: Default::default(),
+            max_tokens: 128,
+            batch_size: 8,
+            repeat_last_n: 64,
+            repeat_penalty: 1.30,
+            temp: 0.80,
+            top_k: 40,
+            top_p: 0.95,
+        }
+    }
 }
 
 #[derive(Serialize)]
-struct CompletionResponse {
-    prompt: String,
+struct GenerateResponse {
     text: String,
+}
+
+async fn completions(
+    State(sender): State<flume::Sender<ThreadGenerateRequest>>,
+    Json(request): Json<GenerateRequest>,
+) -> Json<GenerateResponse> {
+    let (token_sender, token_receiver) = flume::unbounded();
+
+    sender
+        .send(ThreadGenerateRequest(request, token_sender))
+        .unwrap();
+
+    let mut text = String::new();
+    let mut stream = token_receiver.into_stream();
+
+    while let Some(token) = stream.next().await {
+        match token {
+            Token::Token(t) => {
+                text += t.as_str();
+            }
+            Token::EndOfText => {}
+        }
+    }
+
+    Json(GenerateResponse { text })
 }
