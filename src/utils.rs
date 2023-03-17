@@ -1,6 +1,4 @@
 use flume::Receiver;
-use std::sync::{Arc, Barrier};
-
 use llama_rs::LoadProgress;
 
 use crate::ThreadGenerateRequest;
@@ -12,18 +10,14 @@ pub fn start_model_thread(
     num_threads: i32,
     num_ctx_tokens: i32,
 ) {
-    let barrier = Arc::new(Barrier::new(2));
     std::thread::spawn({
-        let barrier = barrier.clone();
         move || {
             let (model, vocab) =
                 llama_rs::Model::load(model_path, num_ctx_tokens, print_progress).unwrap();
 
-            barrier.wait();
-
             let mut rng = rand::thread_rng();
             loop {
-                if let Ok(ThreadGenerateRequest(request, token_tx)) = receiver.try_recv() {
+                if let Ok(ThreadGenerateRequest(request, token_sender)) = receiver.try_recv() {
                     model.inference_with_prompt(
                         &vocab,
                         &llama_rs::InferenceParameters {
@@ -39,9 +33,9 @@ pub fn start_model_thread(
                         &request.prompt,
                         &mut rng,
                         {
-                            let token_tx = token_tx.clone();
+                            let token_sender = token_sender.clone();
                             move |t| {
-                                token_tx
+                                token_sender
                                     .send(match t {
                                         llama_rs::OutputToken::Token(t) => {
                                             Token::Token(t.to_string())
@@ -58,7 +52,6 @@ pub fn start_model_thread(
             }
         }
     });
-    barrier.wait();
 }
 
 pub fn print_progress(progress: LoadProgress) {
